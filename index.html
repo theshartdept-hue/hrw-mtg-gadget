@@ -136,6 +136,27 @@ button.ghost[aria-pressed="true"]{color:var(--acid)}
   body.pinned .rail{align-self:start;margin-top:16px;max-height:calc(100% - 32px)}
   body.pinned .rail p{font-size:1.15rem}
 }
+.ftr .follow-status{display:none;font:500 .8125rem/1 var(--mono);color:var(--acid);letter-spacing:.04em}
+body.follow .ftr .follow-status{display:block}
+body.follow #prevBtn,body.follow #nextBtn,body.follow #pinBtn,body.follow #roomBtn,body.follow #liveBtn,
+body.follow .m-btns,body.follow .wx-sub,body.follow #clearPulse{display:none!important}
+body.follow .progress{cursor:default}
+body.follow .lane-btn,body.follow .wx-add{pointer-events:none}
+#liveBtn.is-live{color:var(--acid);border-color:var(--acid-line)}
+#liveBtn.has-err{color:var(--pink)}
+.waiting{display:flex;flex-direction:column;align-items:flex-start;gap:14px;max-width:36rem;padding-block:6vh}
+.waiting p{font:400 1.2rem/1.55 var(--read);color:var(--bone-70);margin:0}
+.wait-logo{width:72px;height:72px}
+.sheet{position:fixed;inset:0;z-index:40;background:rgba(14,14,20,.9);display:flex;align-items:center;justify-content:center;padding:16px}
+.sheet-card{width:100%;max-width:32rem;background:var(--night-2);border:1px solid var(--bone-18);border-radius:18px;padding:20px;display:flex;flex-direction:column;gap:14px;max-height:90vh;overflow-y:auto}
+.sheet-card h3{font:400 1.8rem/1.1 var(--serif);margin:0}
+.sheet-card p{font:400 1rem/1.5 var(--read);margin:0;color:var(--bone-70)}
+.sheet-card input{width:100%;font:400 1.05rem/1.4 var(--mono);color:var(--bone);background:rgba(0,0,0,.25);border:1px solid var(--bone-18);border-radius:10px;padding:10px 12px}
+.sheet-row{display:flex;gap:8px;justify-content:flex-end;flex-wrap:wrap}
+.link-box{display:flex;gap:8px;align-items:center;flex-wrap:wrap;background:rgba(0,0,0,.25);border:1px solid var(--acid-line);border-radius:10px;padding:10px 12px}
+.link-box code{font:500 .9rem/1.4 var(--mono);color:var(--acid);flex:1;min-width:0;overflow-wrap:anywhere;user-select:all}
+.live-err{color:var(--pink)!important}
+.sheet-x{align-self:flex-end;border:none;color:var(--bone-45);font-weight:400;min-height:32px;padding:0 4px}
 </style>
 
 <div class="app">
@@ -150,6 +171,8 @@ button.ghost[aria-pressed="true"]{color:var(--acid)}
   <footer class="ftr">
     <button id="prevBtn">← Back</button>
     <div class="spacer"></div>
+    <span class="follow-status" id="followStatus"></span>
+    <button id="liveBtn" class="ghost" aria-pressed="false" hidden>Go live</button>
     <button id="pinBtn" class="ghost" aria-pressed="false" title="Keep announcements on screen">Pin announcements</button>
     <button id="roomBtn" class="ghost" aria-pressed="false" title="Hide host notes while screen sharing">Room view</button>
     <button id="nextBtn" class="primary">Next →</button>
@@ -159,6 +182,13 @@ button.ghost[aria-pressed="true"]{color:var(--acid)}
   <div class="ov-list" id="ovList"><button class="ov-close" id="ovClose">Close ✕</button></div>
 </div>
 
+<div class="sheet" id="liveSheet" role="dialog" aria-label="Live follow-along" hidden>
+  <div class="sheet-card"><button class="sheet-x" id="liveClose">Close ✕</button><div id="liveBody" style="display:flex;flex-direction:column;gap:14px"></div></div>
+</div>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-database-compat.js"></script>
+<script src="firebase-config.js"></script>
 <script>
 (() => {
 'use strict';
@@ -166,8 +196,11 @@ const $ = id => document.getElementById(id);
 const SK='pb-hrw-comp.v3', STEP_KEY='pb-hrw-comp.step.v3';
 const DEFAULTS={meetingType:'affinity',affKey:'abcd',affFocused:true,affEdits:{},hostName:'',topic:'',announce:'',room:false,
   pulse:true,pin:false,lane:'',pc:null};
+const params=new URLSearchParams(location.search);
+const FOLLOW=(params.get('follow')||'').toLowerCase().replace(/[^a-z0-9-]/g,'').slice(0,40);
+let followMsg=FOLLOW?'Connecting…':'';
 let S={...DEFAULTS};
-try{
+if(!FOLLOW) try{
   const v3=localStorage.getItem(SK);
   if(v3) S={...S,...JSON.parse(v3)};
   else{
@@ -205,10 +238,59 @@ function pulseRead(){
   s=s.charAt(0).toUpperCase()+s.slice(1)+'.';
   return s;
 }
-const saveS=()=>{try{localStorage.setItem(SK,JSON.stringify(S))}catch(e){}};
+const saveS=()=>{if(FOLLOW)return;try{localStorage.setItem(SK,JSON.stringify(S))}catch(e){}pushLive()};
 let cur=0;
-try{const v=sessionStorage.getItem(STEP_KEY);if(v)cur=Math.max(0,parseInt(v,10)||0)}catch(e){}
-const saveCur=()=>{try{sessionStorage.setItem(STEP_KEY,String(cur))}catch(e){}};
+if(!FOLLOW) try{const v=sessionStorage.getItem(STEP_KEY);if(v)cur=Math.max(0,parseInt(v,10)||0)}catch(e){}
+const saveCur=()=>{if(FOLLOW)return;try{sessionStorage.setItem(STEP_KEY,String(cur))}catch(e){}};
+
+/* ── live follow-along (Firebase Realtime Database) ──
+   Host: rooms/<name> = {owner, live, cur, state, updatedAt}. Followers open ?follow=<name> and mirror it. */
+let fb=null;
+const live={on:false,room:'',ref:null,uid:null,timer:null,err:''};
+function fbReady(){
+  if(fb) return fb;
+  const cfg=window.HRW_FIREBASE;
+  if(!cfg||!cfg.apiKey||!cfg.databaseURL||!window.firebase) return null;
+  try{ if(!firebase.apps.length) firebase.initializeApp(cfg); fb={db:firebase.database(),auth:firebase.auth()}; }catch(e){ return null }
+  return fb;
+}
+const slug=s=>String(s||'').toLowerCase().trim().replace(/[^a-z0-9]+/g,'-').replace(/^-+|-+$/g,'').slice(0,40);
+const followURL=room=>location.origin+location.pathname+'?follow='+encodeURIComponent(room);
+function livePayload(){
+  const {liveRoom,...state}=S;
+  return {owner:live.uid,live:true,cur,state,updatedAt:firebase.database.ServerValue.TIMESTAMP};
+}
+function pushLive(){
+  if(!live.on||FOLLOW) return;
+  clearTimeout(live.timer);
+  live.timer=setTimeout(()=>{live.ref.set(livePayload()).catch(()=>{live.err='Lost the connection to the live room. Check your internet.';renderLiveBtn()})},250);
+}
+async function goLive(room){
+  const f=fbReady(); if(!f) throw new Error('notset');
+  if(!f.auth.currentUser) await f.auth.signInAnonymously();
+  live.uid=f.auth.currentUser.uid; live.room=room; live.ref=f.db.ref('rooms/'+room);
+  live.on=true;
+  try{ await live.ref.set(livePayload()); }
+  catch(e){ live.on=false; live.ref=null; throw new Error('taken'); }
+  live.err=''; S.liveRoom=room; try{localStorage.setItem(SK,JSON.stringify(S))}catch(e){}
+}
+async function stopLive(){
+  if(live.on&&live.ref){ try{ await live.ref.update({live:false,updatedAt:firebase.database.ServerValue.TIMESTAMP}) }catch(e){} }
+  live.on=false; live.ref=null; S.liveRoom=''; try{localStorage.setItem(SK,JSON.stringify(S))}catch(e){}
+}
+function startFollowing(){
+  const f=fbReady();
+  if(!f){ followMsg="Live mode isn't set up on this site yet."; update(); return; }
+  f.db.ref('rooms/'+FOLLOW).on('value',snap=>{
+    const v=snap.val();
+    if(!v){ followMsg='Waiting for the host to go live. This page will update by itself.'; update(); return; }
+    if(!v.live){ followMsg='This meeting has ended. Thank you for being here.'; update(); return; }
+    S={...DEFAULTS,...(v.state||{}),room:true};
+    if(!S.affEdits||typeof S.affEdits!=='object') S.affEdits={};
+    if(!okPulse(S.pc)) S.pc=freshPulse();
+    cur=Math.max(0,v.cur|0); followMsg=''; update();
+  },()=>{ followMsg="Couldn't reach the live room. Check your internet and reload."; update(); });
+}
 
 /* ── affinity templates ──
    name: how the host names the meeting · tag: header label · who: who the room is for
@@ -494,12 +576,26 @@ function headerTag(){
   return S.meetingType==='focused'?'HRW · Focused':'HRW · Open';
 }
 
+function waitingView(msg){
+  return `<div class="waiting"><img class="wait-logo" alt="" src="${document.querySelector('.logo')?.src||''}"><h2 class="step-title">Harm Reduction Works</h2><p>${esc(msg)}</p></div>`;
+}
 function update(keepScroll){
   const steps=vis(), n=steps.length;
   if(cur>=n) cur=0;
   saveCur();
   const y=$('view').scrollTop;
-  $('view').innerHTML=render(steps[cur]);
+  if(FOLLOW&&followMsg){
+    $('view').innerHTML=waitingView(followMsg);
+    $('stepOf').textContent=''; $('progressBar').innerHTML='';
+    $('mtgTag').textContent='HRW';
+    $('rail').hidden=true; document.body.classList.remove('pinned');
+    $('followStatus').textContent='Follow-along';
+    return;
+  }
+  const step=steps[cur];
+  $('view').innerHTML=(FOLLOW&&step.type==='setup')
+    ? waitingView(`${S.hostName.trim()||'Your host'} is getting ready. The meeting will show up here.`)
+    : render(step);
   $('view').scrollTop=keepScroll?y:0;
   $('mtgTag').textContent=headerTag();
   $('stepOf').textContent=`${cur+1} / ${n}`;
@@ -507,9 +603,12 @@ function update(keepScroll){
   $('prevBtn').disabled=cur===0;
   $('nextBtn').disabled=cur===n-1;
   $('nextBtn').textContent=cur===n-1?'End of meeting':'Next →';
-  document.body.classList.toggle('room',!!S.room);
+  document.body.classList.toggle('room',!!S.room||!!FOLLOW);
   $('roomBtn').setAttribute('aria-pressed',S.room?'true':'false');
-  renderRail(steps[cur]);
+  if(FOLLOW) $('followStatus').textContent=`Following ${S.hostName.trim()||'the host'} · live`;
+  renderRail(step);
+  renderLiveBtn();
+  pushLive();
 }
 function renderRail(step){
   const show=S.pin&&S.announce.trim()&&step&&step.type!=='setup'&&!step.announcements;
@@ -518,14 +617,67 @@ function renderRail(step){
   $('rail').hidden=!show;
   if(show) $('rail').innerHTML=`<div class="alabel">Announcements</div><p>${esc(S.announce)}</p>`;
 }
+function renderLiveBtn(){
+  const b=$('liveBtn'); if(!b) return;
+  b.hidden=FOLLOW||!fbReady();
+  b.textContent=live.on?'● Live':'Go live';
+  b.setAttribute('aria-pressed',live.on?'true':'false');
+  b.classList.toggle('is-live',live.on);
+  b.classList.toggle('has-err',!!live.err);
+}
 
-const go=d=>{const t=cur+d;if(t>=0&&t<vis().length){cur=t;update()}};
+/* ── live sheet ── */
+function liveSheet(msg){
+  const box=$('liveBody');
+  if(!fbReady()){
+    box.innerHTML=`<h3>Live follow-along</h3><p>Live mode isn't set up on this copy of the companion. It works on the hosted site once Firebase is connected.</p>`;
+  }else if(!live.on){
+    const sug=S.liveRoom||slug('hrw-'+(S.meetingType==='affinity'?(getAff().tag||'affinity'):S.meetingType));
+    box.innerHTML=`<h3>Go live</h3>
+      <p>People open a link on their own phone or laptop and their screen follows yours: same step, topic, announcements and pulse. They never see host notes.</p>
+      <label class="field"><span>Room name (keep it the same each week so the link never changes)</span>
+        <input type="text" id="liveRoom" value="${esc(sug)}" autocomplete="off" spellcheck="false"></label>
+      ${msg?`<p class="live-err">${esc(msg)}</p>`:''}
+      <div class="sheet-row"><button class="primary" id="liveStart">Go live</button></div>`;
+  }else{
+    const url=followURL(live.room);
+    box.innerHTML=`<h3>You're live</h3>
+      <p>Paste this link in the chat. Anyone who opens it follows along with you.</p>
+      <div class="link-box"><code id="liveLink">${esc(url)}</code><button id="liveCopy">Copy link</button></div>
+      ${live.err?`<p class="live-err">${esc(live.err)}</p>`:''}
+      <p class="tips">The room name is <b>${esc(live.room)}</b>. Anyone with the link can see the script, topic, announcements and pulse counts, so keep names and private details out of those fields.</p>
+      <div class="sheet-row"><button id="liveStop">End live session</button></div>`;
+  }
+  $('liveSheet').hidden=false;
+}
+function closeLive(){$('liveSheet').hidden=true}
+$('liveBtn').addEventListener('click',()=>liveSheet());
+$('liveSheet').addEventListener('click',async e=>{
+  if(e.target===$('liveSheet')||e.target.closest('#liveClose')){closeLive();return}
+  if(e.target.closest('#liveStart')){
+    const room=slug($('liveRoom').value);
+    if(!room){liveSheet('Give the room a name, like abcd-sunday.');return}
+    e.target.disabled=true; e.target.textContent='Connecting…';
+    try{ await goLive(room); renderLiveBtn(); liveSheet(); }
+    catch(err){ liveSheet(err.message==='taken'?'Another host is using that room name right now. Pick a different name, or wait until their meeting ends.':"Couldn't connect to the live room. Check your internet and try again."); }
+    return;
+  }
+  if(e.target.closest('#liveStop')){ await stopLive(); renderLiveBtn(); liveSheet(); return }
+  if(e.target.closest('#liveCopy')){
+    const url=followURL(live.room), btn=e.target.closest('#liveCopy');
+    try{ await navigator.clipboard.writeText(url); btn.textContent='Copied'; }
+    catch(_){ const r=document.createRange(); r.selectNodeContents($('liveLink')); const s=getSelection(); s.removeAllRanges(); s.addRange(r); btn.textContent='Selected, press copy'; }
+  }
+});
+
+const go=d=>{if(FOLLOW)return;const t=cur+d;if(t>=0&&t<vis().length){cur=t;update()}};
 $('prevBtn').addEventListener('click',()=>go(-1));
 $('nextBtn').addEventListener('click',()=>go(1));
 $('roomBtn').addEventListener('click',()=>{S.room=!S.room;saveS();update(true)});
 $('pinBtn').addEventListener('click',()=>{S.pin=!S.pin;saveS();update(true)});
 
 $('view').addEventListener('click',e=>{
+  if(FOLLOW) return;
   const t=e.target.closest('[data-type]');
   if(t){S.meetingType=t.dataset.type;saveS();update(true);return}
   const a=e.target.closest('[data-aff]');
@@ -538,11 +690,13 @@ $('view').addEventListener('click',e=>{
   if(e.target.closest('[data-action="clear-pulse"]')){S.pc=freshPulse();S.lane='';saveS();update(true)}
 });
 $('view').addEventListener('change',e=>{
+  if(FOLLOW) return;
   if(e.target.id==='affFocused'){S.affFocused=e.target.checked;saveS()}
   if(e.target.id==='pinToggle'){S.pin=e.target.checked;saveS();update(true)}
   if(e.target.id==='pulseToggle'){S.pulse=e.target.checked;saveS();update(true)}
 });
 $('view').addEventListener('input',e=>{
+  if(FOLLOW) return;
   const top={hostInput:'hostName',topicInput:'topic',announceInput:'announce'};
   const aff={affName:'name',affTag:'tag',affWho:'who',affWhy:'why',affPrompts:'prompts',affNote:'note'};
   const id=e.target.id;
@@ -557,12 +711,15 @@ $('view').addEventListener('input',e=>{
 
 document.addEventListener('keydown',e=>{
   if(e.target.closest('input,textarea')) return;
+  if(!$('liveSheet').hidden){ if(e.key==='Escape') closeLive(); return; }
   if(!$('overview').hidden){ if(e.key==='Escape') closeOv(); return; }
+  if(FOLLOW) return;
   if(e.key==='ArrowRight'||e.key==='PageDown'){go(1);e.preventDefault()}
   if(e.key==='ArrowLeft'||e.key==='PageUp'){go(-1);e.preventDefault()}
 });
 
 function openOv(){
+  if(FOLLOW) return;
   const list=$('ovList');
   list.querySelectorAll('.ov-item').forEach(el=>el.remove());
   vis().forEach((s,i)=>{
@@ -580,7 +737,11 @@ $('progressBar').addEventListener('keydown',e=>{if(e.key==='Enter'||e.key===' ')
 $('ovClose').addEventListener('click',closeOv);
 $('overview').addEventListener('click',e=>{if(e.target===$('overview'))closeOv()});
 
-update();
+if(FOLLOW){ document.body.classList.add('follow'); update(); startFollowing(); }
+else{
+  update();
+  if(S.liveRoom&&fbReady()) goLive(S.liveRoom).then(()=>update(true)).catch(()=>{S.liveRoom='';renderLiveBtn()});
+}
 })();
 </script>
 

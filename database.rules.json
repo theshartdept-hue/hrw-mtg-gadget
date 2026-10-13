@@ -1,0 +1,13 @@
+{
+  "rules": {
+    ".read": false,
+    ".write": false,
+    "rooms": {
+      "$room": {
+        ".read": true,
+        ".write": "auth != null && (!data.exists() || data.child('owner').val() === auth.uid || data.child('live').val() === false || data.child('updatedAt').val() < now - 14400000)",
+        ".validate": "$room.matches(/^[a-z0-9-]{1,40}$/) && newData.child('owner').val() === auth.uid"
+      }
+    }
+  }
+}
